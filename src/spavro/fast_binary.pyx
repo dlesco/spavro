@@ -229,7 +229,7 @@ class ReaderPlaceholder(object):
     def __call__(self, fo):
         return self.reader(fo)
 
-def get_reader(schema, schema_cache):
+def get_reader(schema, schema_cache, top=False):
     cdef unicode schema_type = get_type(schema)
     if schema_type in (u'record', u'fixed', u'enum'):
         placeholder = ReaderPlaceholder()
@@ -245,6 +245,13 @@ def get_reader(schema, schema_cache):
         reader = reader_type_map[schema_type](schema, schema_cache)
         # now that we've returned, assign the reader to the placeholder
         # so that the execution will work
+        placeholder.reader = reader
+        return reader
+    if top:
+        # If schema is a single primitive type, wrap with placeholder so that
+        # one has a Python callable, instead of just a cdef.
+        placeholder = ReaderPlaceholder()
+        reader = reader_type_map[schema_type](schema, schema_cache)
         placeholder.reader = reader
         return reader
     try:
@@ -666,7 +673,7 @@ class WriterPlaceholder(object):
         return self.writer(fo, val)
 
 
-def get_writer(schema, schema_cache):
+def get_writer(schema, schema_cache, top=False):
     cdef unicode schema_type = get_type(schema)
     if schema_type in (u'record', u'fixed', u'enum'):
         placeholder = WriterPlaceholder()
@@ -682,6 +689,13 @@ def get_writer(schema, schema_cache):
         writer = writer_type_map[schema_type](schema, schema_cache)
         # now that we've returned, assign the reader to the placeholder
         # so that the execution will work
+        placeholder.writer = writer
+        return writer
+    if top:
+        # If schema is a single primitive type, wrap with placeholder so that
+        # one has a Python callable, instead of just a cdef.
+        placeholder = WriterPlaceholder()
+        writer = writer_type_map[schema_type](schema, schema_cache)
         placeholder.writer = writer
         return writer
     try:

@@ -777,7 +777,7 @@ class FastDatumReader(object):
             # schema
             resolved_schema = parsed_writer_schema.to_json()
             self.readers_schema = parsed_writer_schema
-        self.read_datum = get_reader(resolved_schema, dict())
+        self.read_datum = get_reader(resolved_schema, dict(), True)
 
         # schema matching
         if not FastDatumReader.match_schemas(self.writers_schema, self.readers_schema):
@@ -794,7 +794,7 @@ class FastDatumReader(object):
         # try:
         #     datum_reader = self.schema_cache[str(schema)]
         # except KeyError:
-        datum_reader = get_reader(resolved_schema, dict())
+        datum_reader = get_reader(resolved_schema, dict(), True)
         # self.schema_cache[str(schema)] = datum_reader
         return datum_reader(decoder.reader)
 
@@ -815,7 +815,7 @@ class FastDatumWriter(object):
         if parsed_writer_schema:
             # to_json is a terrible method name for something
             # that returns a python dict! :/
-            self.write_datum = get_writer(parsed_writer_schema.to_json(), dict())
+            self.write_datum = get_writer(parsed_writer_schema.to_json(), dict(), True)
 
     def write(self, datum, encoder):
         # validate datum
@@ -828,7 +828,7 @@ class FastDatumWriter(object):
         try:
             datum_writer = self.schema_cache[str(schema)]
         except KeyError:
-            datum_writer = get_writer(schema.to_json(), dict())
+            datum_writer = get_writer(schema.to_json(), dict(), True)
             self.schema_cache[str(schema)] = datum_writer
         datum_writer(encoder.writer, datum)
 
