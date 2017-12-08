@@ -222,7 +222,8 @@ reader_type_map = {
     u'default': make_default_reader
 }
 
-class ReaderPlaceholder(object):
+cdef class ReaderPlaceholder(object):
+    cdef object reader
     def __init__(self):
         self.reader = None
 
@@ -387,55 +388,74 @@ def make_enum_check(schema):
     return enum_check
 
 
+def null_check(datum):
+    return datum is None
+
 def make_null_check(schema):
-    return lambda datum: datum is None
+    return null_check
 
 def check_string(datum):
-    return isinstance(datum, basestring)
+    return isinstance(datum, six.text_type)
 
 def make_string_check(schema):
     return check_string
 
+
+def long_check(datum):
+    return isinstance(datum, six.integer_types)
+
 def make_long_check(schema):
-    return lambda datum: isinstance(datum, int) or isinstance(datum, long)
+    return long_check
+    
+
+def boolean_check(datum):
+    return isinstance(datum, bool)
 
 def make_boolean_check(schema):
-    return lambda datum: isinstance(datum, bool)
+    return boolean_check
 
-# def make_boolean_check(schema):
-#     return lambda datum: isinstance(datum, boolean)
+
+def float_check(datum):
+    return isinstance(datum, six.integer_types) or isinstance(datum, float)
 
 def make_float_check(schema):
-    return lambda datum: isinstance(datum, int) or isinstance(datum, long) or isinstance(datum, float)
+    return float_check
 
 def make_double_check(schema):
-    return lambda datum: isinstance(datum, int) or isinstance(datum, long) or isinstance(datum, float)
+    return float_check
+
+
+def byte_check(datum):
+    return isinstance(datum, six.binary_type)
 
 def make_byte_check(schema):
-    return lambda datum: isinstance(datum, str) or isinstance(datum, bytes)
+    return byte_check
+
 
 def make_array_check(schema):
     item_check = get_check(schema['items'])
     def array_check(datum):
-        return all([item_check(item) for item in datum])
+        return all(item_check(item) for item in datum)
     return array_check
 
 def make_union_check(union_schema):
     cdef list union_checks = [get_check(schema) for schema in union_schema]
     def union_check(datum):
-        return any([check(datum) for check in union_checks])
+        return any(check(datum) for check in union_checks)
     return union_check
 
 def make_fixed_check(schema):
     cdef int size = schema['size']
     def fixed_check(datum):
-        return (isinstance(datum, str) or isinstance(datum, bytes)) and len(datum) == size
+        return isinstance(datum, six.binary_type) and len(datum) == size
     return fixed_check
 
 def make_map_check(schema):
     map_value_check = get_check(schema['values'])
     def map_check(datum):
-        return isinstance(datum, dict) and all([check_string(key) and map_value_check(value) for key, value in datum.items()])
+        return isinstance(datum, dict) and all(check_string(key) 
+            and map_value_check(value) for key, value in six.iteritems(datum)
+        )
     return map_check
 
 check_type_map = {
@@ -579,13 +599,14 @@ def make_map_writer(schema, schema_cache):
     return write_map
 
 
+cdef checked_boolean_writer(outbuf, datum):
+    if not isinstance(datum, bool):
+        raise TypeError("Not a boolean value")
+    write_boolean(outbuf, datum)
+
 def make_boolean_writer(schema, schema_cache):
     '''Create a boolean writer, adds a validation step before the actual
     write function'''
-    def checked_boolean_writer(outbuf, datum):
-        if not isinstance(datum, bool):
-            raise TypeError("Not a boolean value")
-        write_boolean(outbuf, datum)
     return checked_boolean_writer
 
 
@@ -601,25 +622,29 @@ def make_fixed_writer(schema, schema_cache):
     return checked_write_fixed
 
 
+cdef checked_int_write(outbuf, datum):
+    if not (isinstance(datum, six.integer_types)
+        and INT_MIN_VALUE <= datum <= INT_MAX_VALUE
+    ):
+        raise TypeError("Non integer value or overflow")
+    write_long(outbuf, datum)
+
 def make_int_writer(schema, schema_cache):
     '''Create a int writer, adds a validation step before the actual
     write function to make sure the int value doesn't overflow'''
-    def checked_int_write(outbuf, datum):
-        if not (isinstance(datum, six.integer_types)
-                        and INT_MIN_VALUE <= datum <= INT_MAX_VALUE):
-            raise TypeError("Non integer value or overflow")
-        write_long(outbuf, datum)
     return checked_int_write
 
+
+cdef checked_long_write(outbuf, datum):
+    if not (isinstance(datum, six.integer_types)
+        and LONG_MIN_VALUE <= datum <= LONG_MAX_VALUE
+    ):
+        raise TypeError("Non integer value or overflow")
+    write_long(outbuf, datum)
 
 def make_long_writer(schema, schema_cache):
     '''Create a long writer, adds a validation step before the actual
     write function to make sure the long value doesn't overflow'''
-    def checked_long_write(outbuf, datum):
-        if not (isinstance(datum, six.integer_types)
-                        and LONG_MIN_VALUE <= datum <= LONG_MAX_VALUE):
-            raise TypeError("Non integer value or overflow")
-        write_long(outbuf, datum)
     return checked_long_write
 
 
@@ -665,7 +690,8 @@ writer_type_map = {
 }
 
 
-class WriterPlaceholder(object):
+cdef class WriterPlaceholder(object):
+    cdef object writer
     def __init__(self):
         self.writer = None
 
