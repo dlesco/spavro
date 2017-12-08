@@ -139,16 +139,14 @@ def validate(expected_schema, datum):
 #
 # Decoder/Encoder
 #
-import logging
-logging.basicConfig(level=logging.DEBUG)
-log = logging.getLogger(__name__)
+import warnings
 use_fast = False
 try:
     from spavro.fast_binary import get_reader, get_writer
     from spavro.fast_binary import FastBinaryEncoder, FastBinaryDecoder
     use_fast = True
 except ImportError:
-    log.warn("Failed to load spavro C extension, using default slow Encoder/Decoder")
+    warnings.warn("Failed to load spavro C extension, using slow Encoder/Decoder")
 from spavro.binary import BinaryEncoder as SlowBinaryEncoder, BinaryDecoder as SlowBinaryDecoder
 
 #
@@ -779,7 +777,7 @@ class FastDatumReader(object):
             # schema
             resolved_schema = parsed_writer_schema.to_json()
             self.readers_schema = parsed_writer_schema
-        self.read_datum = get_reader(resolved_schema)
+        self.read_datum = get_reader(resolved_schema, dict())
 
         # schema matching
         if not FastDatumReader.match_schemas(self.writers_schema, self.readers_schema):
@@ -796,7 +794,7 @@ class FastDatumReader(object):
         # try:
         #     datum_reader = self.schema_cache[str(schema)]
         # except KeyError:
-        datum_reader = get_reader(resolved_schema)
+        datum_reader = get_reader(resolved_schema, dict())
         # self.schema_cache[str(schema)] = datum_reader
         return datum_reader(decoder.reader)
 
@@ -817,22 +815,20 @@ class FastDatumWriter(object):
         if parsed_writer_schema:
             # to_json is a terrible method name for something
             # that returns a python dict! :/
-            self.write_datum = get_writer(parsed_writer_schema.to_json())
+            self.write_datum = get_writer(parsed_writer_schema.to_json(), dict())
 
     def write(self, datum, encoder):
         # validate datum
         try:
             self.write_datum(encoder.writer, datum)
         except TypeError as ex:
-            log.error(self.write_datum)
-            log.exception("type error")
             raise AvroTypeException(self.writers_schema, datum)
 
     def write_data(self, schema, datum, encoder):
         try:
             datum_writer = self.schema_cache[str(schema)]
         except KeyError:
-            datum_writer = get_writer(schema.to_json())
+            datum_writer = get_writer(schema.to_json(), dict())
             self.schema_cache[str(schema)] = datum_writer
         datum_writer(encoder.writer, datum)
 
