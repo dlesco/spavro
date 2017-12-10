@@ -777,7 +777,7 @@ class FastDatumReader(object):
             # schema
             resolved_schema = parsed_writer_schema.to_json()
             self.readers_schema = parsed_writer_schema
-        self.read_datum = get_reader(resolved_schema, dict(), True)
+        self.read_datum = get_reader(resolved_schema, dict())
 
         # schema matching
         if not FastDatumReader.match_schemas(self.writers_schema, self.readers_schema):
@@ -794,7 +794,7 @@ class FastDatumReader(object):
         # try:
         #     datum_reader = self.schema_cache[str(schema)]
         # except KeyError:
-        datum_reader = get_reader(resolved_schema, dict(), True)
+        datum_reader = get_reader(resolved_schema, dict())
         # self.schema_cache[str(schema)] = datum_reader
         return datum_reader(decoder.reader)
 

@@ -20,7 +20,10 @@ Read/Write Avro File Object Containers.
 """
 import zlib
 import six
-from six import BytesIO as StringIO
+if six.PY2:
+    from cStringIO import StringIO
+else:
+    from six import BytesIO as StringIO
 from spavro import schema
 from spavro import io
 try:

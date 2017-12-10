@@ -11,35 +11,64 @@ INT_MAX_VALUE = (1 << 31) - 1
 LONG_MIN_VALUE = -(1 << 63)
 LONG_MAX_VALUE = (1 << 63) - 1
 
-cdef long long read_long(fo) except? -999999999:
+cdef enum cache_type:
+    ct_namespace
+    ct_array
+    ct_map
+    ct_union
+    ct_skip
+
+cdef class BaseReader(object):
+    # Do not use cpdef, in order to have faster C calls.
+    cdef object c_read(self, fo):
+        raise NotImplementedError
+    def __call__(self, fo):
+        return self.c_read(fo)
+
+
+cdef long long read_long(fo) except? -999999:
     '''Read a long using zig-zag binary encoding'''
     cdef:
-        unsigned long long accum
-        int temp_datum
-        char* c_raw
-        int shift = 7
-    raw = fo.read(1)
-    c_raw = raw
-    temp_datum = <int>c_raw[0]
-    accum = temp_datum & 0x7F
-    while (temp_datum & 0x80) != 0:
-        raw = fo.read(1)
-        c_raw = raw
-        temp_datum = <int>c_raw[0]
-        accum |= (temp_datum & 0x7F) << shift
+        unsigned long long accum = 0
+        unsigned long long digit = 0x80
+        unsigned int shift = 0
+        object read = fo.read
+        bytes buf
+        char c
+    while (digit & 0x80):
+        buf = read(1)
+        c = buf[0]
+        digit = c
+        accum |= (digit & 0x7F) << shift
         shift += 7
     return (accum >> 1) ^ -(accum & 1)
+
+cdef class LongReader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_long(fo)
+
+cdef BaseReader long_reader_singleton = LongReader()
+
 
 cdef bytes read_bytes(fo):
     '''Bytes are a marker for length of bytes and then binary data'''
     return fo.read(read_long(fo))
 
+cdef class BytesReader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_bytes(fo)
 
-cdef read_null(fo):
-    """
-    null is written as zero bytes
-    """
-    return None
+cdef BaseReader bytes_reader_singleton = BytesReader()
+
+
+cdef class NullReader(BaseReader):
+    cdef object c_read(self, fo):
+        """
+        null is written as zero bytes
+        """
+        return None
+
+cdef BaseReader null_reader_singleton = NullReader()
 
 
 cdef read_boolean(fo):
@@ -49,7 +78,14 @@ cdef read_boolean(fo):
     """
     return fo.read(1) == b'\x01'
 
-cdef float read_float(fo) except? -9999.9:
+cdef class BooleanReader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_boolean(fo)
+
+cdef BaseReader boolean_reader_singleton = BooleanReader()
+
+
+cdef float read_float(fo) except? -999999:
     """
     A float is written as 4 bytes.
     The float is converted into a 32-bit integer using a method equivalent to
@@ -59,7 +95,14 @@ cdef float read_float(fo) except? -9999.9:
     cdef char* y = data
     return (<float*>y)[0]
 
-cdef double read_double(fo) except? -99999999.9:
+cdef class FloatReader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_float(fo)
+
+cdef BaseReader float_reader_singleton = FloatReader()
+
+
+cdef double read_double(fo) except? -999999:
     """
     A double is written as 8 bytes.
     The double is converted into a 64-bit integer using a method equivalent to
@@ -69,6 +112,13 @@ cdef double read_double(fo) except? -99999999.9:
     cdef char* y = data
     return (<double*>y)[0]
 
+cdef class DoubleReader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_double(fo)
+
+cdef BaseReader double_reader_singleton = DoubleReader()
+
+
 cdef unicode read_utf8(fo):
     """
     A string is encoded as a long followed by
@@ -77,9 +127,15 @@ cdef unicode read_utf8(fo):
     byte_data = read_bytes(fo)
     return unicode(byte_data, "utf-8")
 
+cdef class Utf8Reader(BaseReader):
+    cdef object c_read(self, fo):
+        return read_utf8(fo)
+
+cdef BaseReader utf8_reader_singleton = Utf8Reader()
+
+
 # ======================================================================
 from collections import namedtuple
-ReadField = namedtuple('ReadField', ['name', 'reader', 'skip'])
 WriteField = namedtuple('WriteField', ['name', 'writer'])
 
 cpdef unicode get_type(schema):
@@ -90,117 +146,216 @@ cpdef unicode get_type(schema):
     else:
         return unicode(schema)
 
+cdef object primitive_types = frozenset((
+    u'null', u'boolean', u'int', u'long', u'float', u'double', 
+    u'bytes', u'string'
+))
+
+
+cdef class UnionReader(BaseReader):
+    cdef tuple readers 
+    def __init__(self, tuple readers):
+        self.readers = readers
+    cdef c_read(self, fo):
+        '''Read the long index for which schema to process, then use that'''
+        cdef Py_ssize_t union_index = read_long(fo)
+        cdef BaseReader reader = self.readers[union_index]
+        return reader.c_read(fo)
 
 def make_union_reader(union_schema, schema_cache):
-    cdef list readers = [get_reader(schema, schema_cache) for schema in union_schema]
+    cdef BaseReader reader
+    cdef tuple schema_types = tuple(get_type(schema) for schema in union_schema)
+    cdef tuple readers
+    if all(schema_type in primitive_types for schema_type in schema_types):
+        try:
+            reader = schema_cache[(ct_union, schema_types)]
+        except KeyError:
+            readers = tuple(get_reader(schema, schema_cache) for schema in union_schema)
+            reader = UnionReader(readers)
+            schema_cache[(ct_union, schema_types)] = reader
+        return reader
+    readers = tuple(get_reader(schema, schema_cache) for schema in union_schema)
+    reader = UnionReader(readers)
+    return reader
+    
 
-    def union_reader(fo):
-        '''Read the long index for which schema to process, then use that'''
-        union_index = read_long(fo)
-        return readers[union_index](fo)
-    union_reader.__reduce__ = lambda: (make_union_reader, (union_schema, schema_cache))
-    return union_reader
+cdef class ReadField(object):
+    cdef object name
+    cdef BaseReader reader
+    cdef bint skip
+    def __cinit__(self, name, reader, skip):
+        self.name = name
+        self.reader = reader
+        self.skip = skip
 
+cdef class RecordReader(BaseReader):
+    cdef tuple fields
+    def __init__(self, fields):
+        self.fields = fields
+    cdef c_read(self, fo):
+        cdef ReadField field
+        cdef dict d = dict()
+        for field in self.fields:
+            if not (field.skip and field.reader.c_read(fo) is None):
+                d[field.name] = field.reader.c_read(fo)
+        return d
 
 def make_record_reader(schema, schema_cache):
-    cdef list fields = [ReadField(field['name'], get_reader(field['type'], schema_cache), get_type(field['type']) == 'skip') for field in schema['fields']]
+    cdef tuple fields = tuple(
+        ReadField(
+            field['name'],
+            get_reader(field['type'], schema_cache),
+            get_type(field['type']) == 'skip'
+        ) for field in schema['fields']
+    )
+    return RecordReader(fields)
 
-    def record_reader(fo):
-        return {field.name: field.reader(fo) for field in fields if not (field.skip and field.reader(fo) is None)}
-    record_reader.__reduce__ = lambda: (make_record_reader, (schema, schema_cache))
-    return record_reader
 
+cdef class EnumReader(BaseReader):
+    cdef tuple symbols
+    def __init__(self, symbols):
+        self.symbols = symbols
+    cdef c_read(self, fo):
+        cdef Py_ssize_t i = read_long(fo)
+        return self.symbols[i]
 
 def make_enum_reader(schema, schema_cache):
-    cdef list symbols = schema['symbols']
+    cdef tuple symbols = tuple(schema['symbols'])
+    return EnumReader(symbols)
 
-    def enum_reader(fo):
-        return symbols[read_long(fo)]
-    enum_reader.__reduce__ = lambda: (make_enum_reader, (schema, schema_cache))
-    return enum_reader
+
+cdef class ArrayReader(BaseReader):
+    cdef BaseReader item_reader
+    def __init__(self, item_reader):
+        self.item_reader = item_reader
+    cdef c_read(self, fo):
+        cdef list read_items = []
+        cdef Py_ssize_t block_count = read_long(fo)
+        while block_count != 0:
+            if block_count < 0:
+                block_count = -block_count
+                read_long(fo) # we don't use the block bytes count
+            for i in range(block_count):
+                read_items.append(self.item_reader.c_read(fo))
+            block_count = read_long(fo)
+        return read_items
 
 def make_array_reader(schema, schema_cache):
-    item_reader = get_reader(schema['items'], schema_cache)
-    def array_reader(fo):
-        cdef long block_count
-        cdef list read_items = []
-        block_count = read_long(fo)
-        while block_count != 0:
-            if block_count < 0:
-                block_count = -block_count
-                block_size = read_long(fo)
-            for i in range(block_count):
-                read_items.append(item_reader(fo))
-            block_count = read_long(fo)
-        return read_items
-    array_reader.__reduce__ = lambda: (make_array_reader, (schema, schema_cache))
-    return array_reader
+    cdef BaseReader reader
+    item_schema = schema['items']
+    item_type = get_type(item_schema)
+    if item_type in primitive_types:
+        try:
+            reader = schema_cache[(ct_array, item_type)]
+        except KeyError:
+            reader = ArrayReader(get_reader(item_schema, schema_cache))
+            schema_cache[(ct_array, item_type)] = reader
+        return reader
+    reader = ArrayReader(get_reader(item_schema, schema_cache))
+    return reader
 
-def make_map_reader(schema, schema_cache):
-    value_reader = get_reader(schema['values'], schema_cache)
 
-    def map_reader(fo):
-        cdef long block_count = read_long(fo)
+cdef class MapReader(BaseReader):
+    cdef BaseReader value_reader
+    def __init__(self, value_reader):
+        self.value_reader = value_reader
+    cdef c_read(self, fo):
         cdef dict read_items = {}
+        cdef Py_ssize_t block_count = read_long(fo)
         while block_count != 0:
             if block_count < 0:
                 block_count = -block_count
-                block_size = read_long(fo)
+                read_long(fo) # we don't use the block bytes count
             for _ in range(block_count):
                 key = read_utf8(fo)
-                read_items[key] = value_reader(fo)
+                read_items[key] = self.value_reader.c_read(fo)
             block_count = read_long(fo)
         return read_items
-    map_reader.__reduce__ = lambda: (make_map_reader, (schema, schema_cache))
-    return map_reader
+
+def make_map_reader(schema, schema_cache):
+    cdef BaseReader reader
+    value_schema = schema['values']
+    value_type = get_type(value_schema)
+    if value_type in primitive_types:
+        try:
+            reader = schema_cache[(ct_map, value_type)]
+        except KeyError:
+            reader = MapReader(get_reader(value_schema, schema_cache))
+            schema_cache[(ct_map, value_type)] = reader
+        return reader
+    reader = MapReader(get_reader(value_schema, schema_cache))
+    return reader
+
+
+cdef class FixedReader(BaseReader):
+    cdef Py_ssize_t size
+    def __init__(self, size):
+        self.size = size
+    cdef c_read(self, fo):
+        return fo.read(self.size)
 
 def make_fixed_reader(schema, schema_cache):
-    cdef long size = schema['size']
+    cdef Py_ssize_t size = schema['size']
+    return FixedReader(size)
 
-    def fixed_reader(fo):
-        return fo.read(size)
-    fixed_reader.__reduce__ = lambda: (make_fixed_reader, (schema, schema_cache))
-    return fixed_reader
 
 def make_null_reader(schema, schema_cache):
-    return read_null
+    return null_reader_singleton
 
 def make_string_reader(schema, schema_cache):
-    return read_utf8
+    return utf8_reader_singleton
 
 def make_boolean_reader(schema, schema_cache):
-    return read_boolean
+    return boolean_reader_singleton
 
 def make_double_reader(schema, schema_cache):
-    return read_double
+    return double_reader_singleton
 
 def make_long_reader(schema, schema_cache):
-    return read_long
+    return long_reader_singleton
 
 def make_byte_reader(schema, schema_cache):
-    return read_bytes
+    return bytes_reader_singleton
 
 def make_float_reader(schema, schema_cache):
-    return read_float
+    return float_reader_singleton
 
+
+cdef class SkipReader(BaseReader):
+    cdef BaseReader value_reader
+    def __init__(self, value_reader):
+        self.value_reader = value_reader
+    cdef c_read(self, fo):
+        self.value_reader.c_read(fo)
+        return None
 
 def make_skip_reader(schema, schema_cache):
     # this will create a regular reader that will iterate the bytes
     # in the avro stream properly
-    value_reader = get_reader(schema['value'], schema_cache)
-    def read_skip(fo):
-        value_reader(fo)
-        return None
-    read_skip.__reduce__ = lambda: (make_skip_reader, (schema, schema_cache))
-    return read_skip
+    cdef BaseReader reader
+    value_schema = schema['value']
+    value_type = get_type(value_schema)
+    if value_type in primitive_types:
+        try:
+            reader = schema_cache[(ct_skip, value_type)]
+        except KeyError:
+            reader = SkipReader(get_reader(value_schema, schema_cache))
+            schema_cache[(ct_skip, value_type)] = reader
+        return reader
+    reader = SkipReader(get_reader(value_schema, schema_cache))
+    return reader
 
+
+cdef class DefaultReader(BaseReader):
+    cdef object value
+    def __init__(self, value):
+        self.value = value 
+    cdef c_read(self, fo):
+        return self.value
 
 def make_default_reader(schema, schema_cache):
-    value = schema["value"]
-    def read_default(fo):
-        return value
-    read_default.__reduce__ = lambda: (make_default_reader, (schema, schema_cache))
-    return read_default
+    cdef BaseReader reader = DefaultReader(schema["value"])
+    return reader
 
 
 reader_type_map = {
@@ -222,44 +377,39 @@ reader_type_map = {
     u'default': make_default_reader
 }
 
-cdef class ReaderPlaceholder(object):
-    cdef object reader
+cdef class ReaderPlaceholder(BaseReader):
+    cdef BaseReader actual_reader
     def __init__(self):
-        self.reader = None
-
-    def __call__(self, fo):
-        return self.reader(fo)
-
-def get_reader(schema, schema_cache, top=False):
+        self.actual_reader = null_reader_singleton
+    cdef object c_read(self, fo):
+        return self.actual_reader.c_read(fo)
+    
+cpdef BaseReader get_reader(schema, dict schema_cache):
     cdef unicode schema_type = get_type(schema)
-    if schema_type in (u'record', u'fixed', u'enum'):
-        placeholder = ReaderPlaceholder()
-        # using a placeholder because this is recursive and the reader isn't defined
-        # yet and nested records might refer to this parent schema name
-        namespace = schema.get('namespace')
-        record_name = schema.get('name')
-        if namespace:
-           namspace_record_name = '.'.join([namespace, record_name])
-        else:
-            namspace_record_name = record_name
-        schema_cache[namspace_record_name] = placeholder
-        reader = reader_type_map[schema_type](schema, schema_cache)
-        # now that we've returned, assign the reader to the placeholder
-        # so that the execution will work
-        placeholder.reader = reader
-        return reader
-    if top:
-        # If schema is a single primitive type, wrap with placeholder so that
-        # one has a Python callable, instead of just a cdef.
-        placeholder = ReaderPlaceholder()
-        reader = reader_type_map[schema_type](schema, schema_cache)
-        placeholder.reader = reader
-        return reader
-    try:
-        reader_func = reader_type_map[schema_type]
-    except KeyError:
-        return schema_cache[schema_type]
-    return reader_func(schema, schema_cache)
+    cdef ReaderPlaceholder placeholder = ReaderPlaceholder()
+    cdef BaseReader reader = placeholder
+    
+    if schema_type not in (u'record', u'fixed', u'enum'):
+        try:
+            maker = reader_type_map[schema_type]
+        except KeyError:
+            return schema_cache[(ct_namespace, schema_type)]
+        return maker(schema, schema_cache)
+        
+    # using a placeholder because this is recursive and the reader isn't defined
+    # yet and nested records might refer to this parent schema name
+    namespace = schema.get('namespace')
+    record_name = schema.get('name')
+    if namespace:
+        namspace_record_name = '.'.join([namespace, record_name])
+    else:
+        namspace_record_name = record_name
+    schema_cache[(ct_namespace, namspace_record_name)] = reader
+    reader = reader_type_map[schema_type](schema, schema_cache)
+    # now that we've returned, assign the reader to the placeholder
+    # so that the execution will work
+    placeholder.actual_reader = reader
+    return reader
 
 # ======================================================================
 
