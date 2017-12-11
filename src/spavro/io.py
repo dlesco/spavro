@@ -787,7 +787,7 @@ class FastDatumReader(object):
     def read(self, decoder):
         # keeping the API the same, we wrap the read_datum in read
         # and pass the underlying file object to the read_datum function
-        return self.read_datum(decoder.reader)
+        return self.read_datum.read(decoder.reader)
 
     def read_data(self, writers_schema, readers_schema, decoder):
         resolved_schema = resolve(writers_schema.to_json(), readers_schema.to_json())
@@ -796,7 +796,7 @@ class FastDatumReader(object):
         # except KeyError:
         datum_reader = get_reader(resolved_schema, dict())
         # self.schema_cache[str(schema)] = datum_reader
-        return datum_reader(decoder.reader)
+        return datum_reader.read(decoder.reader)
 
 
 class FastDatumWriter(object):
@@ -815,22 +815,24 @@ class FastDatumWriter(object):
         if parsed_writer_schema:
             # to_json is a terrible method name for something
             # that returns a python dict! :/
-            self.write_datum = get_writer(parsed_writer_schema.to_json(), dict(), True)
+            self.write_datum = get_writer(parsed_writer_schema.to_json(), dict())
 
     def write(self, datum, encoder):
         # validate datum
         try:
-            self.write_datum(encoder.writer, datum)
+            self.write_datum.write(encoder.writer, datum)
+        except AvroTypeException:
+            raise
         except TypeError as ex:
-            raise AvroTypeException(self.writers_schema, datum)
+            raise AvroTypeException(self.writers_schema, datum, str(ex))
 
     def write_data(self, schema, datum, encoder):
         try:
             datum_writer = self.schema_cache[str(schema)]
         except KeyError:
-            datum_writer = get_writer(schema.to_json(), dict(), True)
+            datum_writer = get_writer(schema.to_json(), dict())
             self.schema_cache[str(schema)] = datum_writer
-        datum_writer(encoder.writer, datum)
+        datum_writer.write(encoder.writer, datum)
 
 if use_fast:
     DatumReader = FastDatumReader

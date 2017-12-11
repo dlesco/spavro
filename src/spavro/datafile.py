@@ -47,13 +47,13 @@ META_SCHEMA = schema.parse("""\
      {"name": "meta", "type": {"type": "map", "values": "bytes"}},
      {"name": "sync", "type": {"type": "fixed", "name": "sync", "size": %d}}]}
 """ % (MAGIC_SIZE, SYNC_SIZE))
-VALID_CODECS = ['null', 'deflate']
+VALID_CODECS = [b'null', b'deflate']
 if has_snappy:
-        VALID_CODECS.append('snappy')
-VALID_ENCODINGS = ['binary'] # not used yet
+        VALID_CODECS.append(b'snappy')
+VALID_ENCODINGS = [b'binary'] # not used yet
 
-CODEC_KEY = "avro.codec"
-SCHEMA_KEY = "avro.schema"
+CODEC_KEY = u"avro.codec"
+SCHEMA_KEY = u"avro.schema"
 
 #
 # Exceptions
@@ -78,7 +78,7 @@ class DataFileWriter(object):
         return generate_sixteen_random_bytes()
 
     # TODO(hammer): make 'encoder' a metadata property
-    def __init__(self, writer, datum_writer, writers_schema=None, codec='null'):
+    def __init__(self, writer, datum_writer, writers_schema=None, codec=b'null'):
         """
         If the schema is not present, presume we're appending.
 
@@ -97,8 +97,8 @@ class DataFileWriter(object):
             if codec not in VALID_CODECS:
                 raise DataFileException("Unknown codec: %r" % codec)
             self._sync_marker = DataFileWriter.generate_sync_marker()
-            self.set_meta('avro.codec', codec)
-            self.set_meta('avro.schema', str(writers_schema))
+            self.set_meta(CODEC_KEY, codec)
+            self.set_meta(SCHEMA_KEY, str(writers_schema))
             self.datum_writer.writers_schema = writers_schema
         else:
             # open writer for reading to collect metadata
@@ -107,11 +107,11 @@ class DataFileWriter(object):
             # TODO(hammer): collect arbitrary metadata
             # collect metadata
             self._sync_marker = dfr.sync_marker
-            self.set_meta('avro.codec', dfr.get_meta('avro.codec'))
+            self.set_meta(CODEC_KEY, dfr.get_meta(CODEC_KEY))
 
             # get schema used to write existing file
-            schema_from_file = dfr.get_meta('avro.schema')
-            self.set_meta('avro.schema', schema_from_file)
+            schema_from_file = dfr.get_meta(SCHEMA_KEY)
+            self.set_meta(SCHEMA_KEY, schema_from_file)
             self.datum_writer.writers_schema = schema.parse(schema_from_file)
 
             # seek to the end of the file and prepare for writing

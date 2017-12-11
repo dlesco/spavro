@@ -22,10 +22,10 @@ import json
 
 class AvroTypeException(schema.AvroException):
     """Raised when datum is not an example of schema."""
-    def __init__(self, expected_schema, datum):
+    def __init__(self, expected_schema, datum, message=''):
         pretty_expected = json.dumps(json.loads(str(expected_schema)), indent=2)
-        fail_msg = "The datum %s is not an example of the schema %s"\
-                             % (datum, pretty_expected)
+        fail_msg = "%s\nThe datum:\n%s is not an example of the schema:\n%s"\
+                             % (message, datum, pretty_expected)
         schema.AvroException.__init__(self, fail_msg)
 
 

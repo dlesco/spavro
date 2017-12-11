@@ -6,6 +6,7 @@ a reader/writer call tree from the schema shape. All reads and writes then
 no longer consult the schema saving lookups.'''
 
 import six
+from spavro.exceptions import AvroTypeException
 INT_MIN_VALUE = -(1 << 31)
 INT_MAX_VALUE = (1 << 31) - 1
 LONG_MIN_VALUE = -(1 << 63)
@@ -18,12 +19,16 @@ cdef enum cache_type:
     ct_union
     ct_skip
 
-cdef class BaseReader(object):
+cdef class BaseSerDe(object):
     # Do not use cpdef, in order to have faster C calls.
     cdef object c_read(self, fo):
         raise NotImplementedError
-    def __call__(self, fo):
+    cdef int c_write(self, fo, datum) except -1:
+        raise NotImplementedError
+    def read(self, fo):
         return self.c_read(fo)
+    def write(self, fo, datum):
+        self.c_write(fo, datum)
 
 
 cdef long long read_long(fo) except? -999999:
@@ -43,32 +48,47 @@ cdef long long read_long(fo) except? -999999:
         shift += 7
     return (accum >> 1) ^ -(accum & 1)
 
-cdef class LongReader(BaseReader):
+cdef class LongSerDe(BaseSerDe):
     cdef object c_read(self, fo):
         return read_long(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        return checked_long_write(fo, datum)
 
-cdef BaseReader long_reader_singleton = LongReader()
+cdef class IntSerDe(BaseSerDe):
+    cdef object c_read(self, fo):
+        return read_long(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        return checked_int_write(fo, datum)
+
+cdef BaseSerDe long_serde_singleton = LongSerDe()
+cdef BaseSerDe int_serde_singleton = IntSerDe()
 
 
 cdef bytes read_bytes(fo):
     '''Bytes are a marker for length of bytes and then binary data'''
     return fo.read(read_long(fo))
 
-cdef class BytesReader(BaseReader):
+cdef class BytesSerDe(BaseSerDe):
     cdef object c_read(self, fo):
         return read_bytes(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        if isinstance(datum, bytes):
+            return write_bytes(fo, datum)
+        return write_utf8(fo, datum)
 
-cdef BaseReader bytes_reader_singleton = BytesReader()
+cdef BaseSerDe bytes_serde_singleton = BytesSerDe()
 
 
-cdef class NullReader(BaseReader):
+cdef class NullSerDe(BaseSerDe):
     cdef object c_read(self, fo):
         """
         null is written as zero bytes
         """
         return None
+    cdef int c_write(self, fo, datum) except -1:
+        return 0
 
-cdef BaseReader null_reader_singleton = NullReader()
+cdef BaseSerDe null_serde_singleton = NullSerDe()
 
 
 cdef read_boolean(fo):
@@ -76,67 +96,80 @@ cdef read_boolean(fo):
     a boolean is written as a single byte 
     whose value is either 0 (false) or 1 (true).
     """
-    return fo.read(1) == b'\x01'
+    return fo.read(1) != b'\x00' # Lenient: any non-zero value is true
 
-cdef class BooleanReader(BaseReader):
+cdef class BooleanSerDe(BaseSerDe):
     cdef object c_read(self, fo):
         return read_boolean(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        return checked_boolean_writer(fo, datum)
 
-cdef BaseReader boolean_reader_singleton = BooleanReader()
+cdef BaseSerDe boolean_serde_singleton = BooleanSerDe()
 
 
-cdef float read_float(fo) except? -999999:
-    """
-    A float is written as 4 bytes.
-    The float is converted into a 32-bit integer using a method equivalent to
-    Java's floatToIntBits and then encoded in little-endian format.
-    """
-    data = fo.read(4)
-    cdef char* y = data
-    return (<float*>y)[0]
+from struct import Struct
+# Make float/double portable by using struct module.
 
-cdef class FloatReader(BaseReader):
+cdef class FloatSerDe(BaseSerDe):
+    cdef object pack
+    cdef object unpack
+    def __init__(self):
+        """
+        A float is written as 4 bytes.
+        The float is converted into a 32-bit integer using a method equivalent to
+        Java's floatToIntBits and then encoded in little-endian format.
+        """
+        s = Struct('<f')
+        self.pack = s.pack
+        self.unpack = s.unpack
     cdef object c_read(self, fo):
-        return read_float(fo)
+        return self.unpack(fo.read(4))[0]
+    cdef int c_write(self, fo, datum) except -1:
+        fo.write(self.pack(datum))
+        return 0
 
-cdef BaseReader float_reader_singleton = FloatReader()
-
-
-cdef double read_double(fo) except? -999999:
-    """
-    A double is written as 8 bytes.
-    The double is converted into a 64-bit integer using a method equivalent to
-    Java's doubleToLongBits and then encoded in little-endian format.
-    """
-    data = fo.read(8)
-    cdef char* y = data
-    return (<double*>y)[0]
-
-cdef class DoubleReader(BaseReader):
+cdef class DoubleSerDe(BaseSerDe):
+    cdef object pack
+    cdef object unpack
+    def __init__(self):
+        """
+        A double is written as 8 bytes.
+        The double is converted into a 64-bit integer using a method equivalent to
+        Java's doubleToLongBits and then encoded in little-endian format.
+        """
+        s = Struct('<d')
+        self.pack = s.pack
+        self.unpack = s.unpack
     cdef object c_read(self, fo):
-        return read_double(fo)
+        return self.unpack(fo.read(8))[0]
+    cdef int c_write(self, fo, datum) except -1:
+        fo.write(self.pack(datum))
+        return 0
 
-cdef BaseReader double_reader_singleton = DoubleReader()
+cdef BaseSerDe float_serde_singleton = FloatSerDe()
+cdef BaseSerDe double_serde_singleton = DoubleSerDe()
 
 
+from cpython.unicode cimport PyUnicode_FromEncodedObject
 cdef unicode read_utf8(fo):
     """
     A string is encoded as a long followed by
     that many bytes of UTF-8 encoded character data.
     """
-    byte_data = read_bytes(fo)
-    return unicode(byte_data, "utf-8")
+    cdef bytes byte_data = read_bytes(fo)
+    return PyUnicode_FromEncodedObject(byte_data, "utf-8", "replace")
 
-cdef class Utf8Reader(BaseReader):
+cdef class Utf8SerDe(BaseSerDe):
     cdef object c_read(self, fo):
-        return read_utf8(fo)
+        cdef unicode obj = read_utf8(fo)
+        return obj
+    cdef int c_write(self, fo, datum) except -1:
+        return write_utf8(fo, datum)
 
-cdef BaseReader utf8_reader_singleton = Utf8Reader()
+cdef BaseSerDe utf8_serde_singleton = Utf8SerDe()
 
 
 # ======================================================================
-from collections import namedtuple
-WriteField = namedtuple('WriteField', ['name', 'writer'])
 
 cpdef unicode get_type(schema):
     if isinstance(schema, list):
@@ -152,18 +185,43 @@ cdef object primitive_types = frozenset((
 ))
 
 
-cdef class UnionReader(BaseReader):
+cdef class UnionSerDe(BaseSerDe):
+    cdef object schema
     cdef tuple readers 
-    def __init__(self, tuple readers):
+    cdef dict writer_lookup_dict
+    cdef bint simple
+    def __init__(self, schema, tuple readers=None, dict writer_lookup_dict=None, simple=True):
+        self.schema = schema
         self.readers = readers
+        self.writer_lookup_dict = writer_lookup_dict
+        self.simple = simple
     cdef c_read(self, fo):
         '''Read the long index for which schema to process, then use that'''
         cdef Py_ssize_t union_index = read_long(fo)
-        cdef BaseReader reader = self.readers[union_index]
+        cdef BaseSerDe reader = self.readers[union_index]
         return reader.c_read(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        cdef Py_ssize_t idx
+        cdef BaseSerDe writer
+        cdef list lookup_result
+        if self.simple:
+            idx, writer = self.writer_lookup_dict[type(datum)]
+        else:
+            lookup_result = self.writer_lookup_dict[type(datum)]
+            if len(lookup_result) == 1:
+                idx, get_check, writer = lookup_result[0]
+            else:
+                for idx, get_check, writer in lookup_result:
+                    if get_check(datum):
+                        break
+                else:
+                    raise AvroTypeException(self.schema, datum)
+        write_long(fo, idx)
+        return writer.c_write(fo, datum)
+
 
 def make_union_reader(union_schema, schema_cache):
-    cdef BaseReader reader
+    cdef BaseSerDe reader
     cdef tuple schema_types = tuple(get_type(schema) for schema in union_schema)
     cdef tuple readers
     if all(schema_type in primitive_types for schema_type in schema_types):
@@ -171,63 +229,77 @@ def make_union_reader(union_schema, schema_cache):
             reader = schema_cache[(ct_union, schema_types)]
         except KeyError:
             readers = tuple(get_reader(schema, schema_cache) for schema in union_schema)
-            reader = UnionReader(readers)
+            reader = UnionSerDe(union_schema, readers)
             schema_cache[(ct_union, schema_types)] = reader
         return reader
     readers = tuple(get_reader(schema, schema_cache) for schema in union_schema)
-    reader = UnionReader(readers)
+    reader = UnionSerDe(union_schema, readers)
     return reader
     
 
-cdef class ReadField(object):
+cdef class RecordField(object):
     cdef object name
-    cdef BaseReader reader
+    cdef BaseSerDe serde
     cdef bint skip
-    def __cinit__(self, name, reader, skip):
+    def __cinit__(self, name, serde, skip):
         self.name = name
-        self.reader = reader
+        self.serde = serde
         self.skip = skip
 
-cdef class RecordReader(BaseReader):
+cdef class RecordSerDe(BaseSerDe):
     cdef tuple fields
     def __init__(self, fields):
         self.fields = fields
     cdef c_read(self, fo):
-        cdef ReadField field
+        cdef RecordField field
         cdef dict d = dict()
         for field in self.fields:
-            if not (field.skip and field.reader.c_read(fo) is None):
-                d[field.name] = field.reader.c_read(fo)
+            if not (field.skip and field.serde.c_read(fo) is None):
+                d[field.name] = field.serde.c_read(fo)
         return d
+    cdef int c_write(self, fo, datum) except -1:
+        cdef RecordField field
+        cdef object value
+        for field in self.fields:
+            try:
+                value = datum[field.name]
+            except KeyError:
+                value = None
+            field.serde.c_write(fo, value)
+        return 0
 
 def make_record_reader(schema, schema_cache):
     cdef tuple fields = tuple(
-        ReadField(
+        RecordField(
             field['name'],
             get_reader(field['type'], schema_cache),
             get_type(field['type']) == 'skip'
         ) for field in schema['fields']
     )
-    return RecordReader(fields)
+    return RecordSerDe(fields)
 
 
-cdef class EnumReader(BaseReader):
+cdef class EnumSerDe(BaseSerDe):
     cdef tuple symbols
     def __init__(self, symbols):
         self.symbols = symbols
     cdef c_read(self, fo):
         cdef Py_ssize_t i = read_long(fo)
         return self.symbols[i]
+    cdef int c_write(self, fo, datum) except -1:
+        cdef Py_ssize_t i = self.symbols.index(datum)
+        write_long(fo, i)
+        return 0
 
 def make_enum_reader(schema, schema_cache):
     cdef tuple symbols = tuple(schema['symbols'])
-    return EnumReader(symbols)
+    return EnumSerDe(symbols)
 
 
-cdef class ArrayReader(BaseReader):
-    cdef BaseReader item_reader
-    def __init__(self, item_reader):
-        self.item_reader = item_reader
+cdef class ArraySerDe(BaseSerDe):
+    cdef BaseSerDe item_serde
+    def __init__(self, item_serde):
+        self.item_serde = item_serde
     cdef c_read(self, fo):
         cdef list read_items = []
         cdef Py_ssize_t block_count = read_long(fo)
@@ -236,31 +308,41 @@ cdef class ArrayReader(BaseReader):
                 block_count = -block_count
                 read_long(fo) # we don't use the block bytes count
             for i in range(block_count):
-                read_items.append(self.item_reader.c_read(fo))
+                read_items.append(self.item_serde.c_read(fo))
             block_count = read_long(fo)
         return read_items
+    cdef int c_write(self, fo, datum) except -1:
+        cdef Py_ssize_t item_count = len(datum)
+        if item_count > 0:
+            write_long(fo, item_count)
+        for item in datum:
+            self.item_serde.c_write(fo, item)
+        write_long(fo, 0)
+
 
 def make_array_reader(schema, schema_cache):
-    cdef BaseReader reader
+    cdef BaseSerDe reader
     item_schema = schema['items']
     item_type = get_type(item_schema)
     if item_type in primitive_types:
         try:
             reader = schema_cache[(ct_array, item_type)]
         except KeyError:
-            reader = ArrayReader(get_reader(item_schema, schema_cache))
+            reader = ArraySerDe(get_reader(item_schema, schema_cache))
             schema_cache[(ct_array, item_type)] = reader
         return reader
-    reader = ArrayReader(get_reader(item_schema, schema_cache))
+    reader = ArraySerDe(get_reader(item_schema, schema_cache))
     return reader
 
 
-cdef class MapReader(BaseReader):
-    cdef BaseReader value_reader
-    def __init__(self, value_reader):
-        self.value_reader = value_reader
+cdef class MapSerDe(BaseSerDe):
+    cdef BaseSerDe value_serde
+    def __init__(self, value_serde):
+        self.value_serde = value_serde
     cdef c_read(self, fo):
-        cdef dict read_items = {}
+        cdef dict read_items = dict()
+        cdef unicode key
+        cdef object value
         cdef Py_ssize_t block_count = read_long(fo)
         while block_count != 0:
             if block_count < 0:
@@ -268,61 +350,83 @@ cdef class MapReader(BaseReader):
                 read_long(fo) # we don't use the block bytes count
             for _ in range(block_count):
                 key = read_utf8(fo)
-                read_items[key] = self.value_reader.c_read(fo)
+                value = self.value_serde.c_read(fo)
+                read_items[key] = value 
             block_count = read_long(fo)
         return read_items
+    cdef int c_write(self, fo, datum) except -1:
+        cdef Py_ssize_t item_count
+        cdef unicode key
+        if datum is not None:
+            item_count = len(datum)
+            if item_count > 0:
+                write_long(fo, item_count)
+                for key, value in six.iteritems(datum):
+                    write_utf8(fo, key)
+                    self.value_serde.c_write(fo, value)
+        return write_long(fo, 0)
+
 
 def make_map_reader(schema, schema_cache):
-    cdef BaseReader reader
+    cdef BaseSerDe reader
     value_schema = schema['values']
     value_type = get_type(value_schema)
     if value_type in primitive_types:
         try:
             reader = schema_cache[(ct_map, value_type)]
         except KeyError:
-            reader = MapReader(get_reader(value_schema, schema_cache))
+            reader = MapSerDe(get_reader(value_schema, schema_cache))
             schema_cache[(ct_map, value_type)] = reader
         return reader
-    reader = MapReader(get_reader(value_schema, schema_cache))
+    reader = MapSerDe(get_reader(value_schema, schema_cache))
     return reader
 
 
-cdef class FixedReader(BaseReader):
+cdef class FixedSerDe(BaseSerDe):
     cdef Py_ssize_t size
-    def __init__(self, size):
+    cdef object schema
+    def __init__(self, size, schema):
         self.size = size
+        self.schema = schema
     cdef c_read(self, fo):
         return fo.read(self.size)
+    cdef int c_write(self, fo, datum) except -1:
+        cdef bytes bytes_data = datum
+        if len(datum) != self.size:
+            raise AvroTypeException(self.schema, datum)
+        fo.write(bytes_data)
+        return 0
+
 
 def make_fixed_reader(schema, schema_cache):
     cdef Py_ssize_t size = schema['size']
-    return FixedReader(size)
+    return FixedSerDe(size, schema)
 
 
 def make_null_reader(schema, schema_cache):
-    return null_reader_singleton
+    return null_serde_singleton
 
 def make_string_reader(schema, schema_cache):
-    return utf8_reader_singleton
+    return utf8_serde_singleton
 
 def make_boolean_reader(schema, schema_cache):
-    return boolean_reader_singleton
+    return boolean_serde_singleton
 
 def make_double_reader(schema, schema_cache):
-    return double_reader_singleton
+    return double_serde_singleton
 
 def make_long_reader(schema, schema_cache):
-    return long_reader_singleton
+    return long_serde_singleton
 
 def make_byte_reader(schema, schema_cache):
-    return bytes_reader_singleton
+    return bytes_serde_singleton
 
 def make_float_reader(schema, schema_cache):
-    return float_reader_singleton
+    return float_serde_singleton
 
 
-cdef class SkipReader(BaseReader):
-    cdef BaseReader value_reader
+cdef class SkipReader(BaseSerDe):
+    cdef BaseSerDe value_reader
     def __init__(self, value_reader):
         self.value_reader = value_reader
     cdef c_read(self, fo):
@@ -332,8 +436,10 @@ cdef class SkipReader(BaseReader):
 def make_skip_reader(schema, schema_cache):
     # this will create a regular reader that will iterate the bytes
     # in the avro stream properly
-    cdef BaseReader reader
+    cdef BaseSerDe reader
     value_schema = schema['value']
+    if value_schema == u'string':
+        value_schema = u'bytes' # Use bytes reader, skip converting to unicode
     value_type = get_type(value_schema)
     if value_type in primitive_types:
         try:
@@ -346,7 +452,7 @@ def make_skip_reader(schema, schema_cache):
     return reader
 
 
-cdef class DefaultReader(BaseReader):
+cdef class DefaultReader(BaseSerDe):
     cdef object value
     def __init__(self, value):
         self.value = value 
@@ -354,7 +460,7 @@ cdef class DefaultReader(BaseReader):
         return self.value
 
 def make_default_reader(schema, schema_cache):
-    cdef BaseReader reader = DefaultReader(schema["value"])
+    cdef BaseSerDe reader = DefaultReader(schema["value"])
     return reader
 
 
@@ -377,17 +483,19 @@ reader_type_map = {
     u'default': make_default_reader
 }
 
-cdef class ReaderPlaceholder(BaseReader):
-    cdef BaseReader actual_reader
+cdef class PlaceholderSerDe(BaseSerDe):
+    cdef BaseSerDe serde
     def __init__(self):
-        self.actual_reader = null_reader_singleton
+        self.serde = null_serde_singleton
     cdef object c_read(self, fo):
-        return self.actual_reader.c_read(fo)
+        return self.serde.c_read(fo)
+    cdef int c_write(self, fo, datum) except -1:
+        return self.serde.c_write(fo, datum)
     
-cpdef BaseReader get_reader(schema, dict schema_cache):
+cpdef BaseSerDe get_reader(schema, dict schema_cache):
     cdef unicode schema_type = get_type(schema)
-    cdef ReaderPlaceholder placeholder = ReaderPlaceholder()
-    cdef BaseReader reader = placeholder
+    cdef PlaceholderSerDe placeholder = PlaceholderSerDe()
+    cdef BaseSerDe reader = placeholder
     
     if schema_type not in (u'record', u'fixed', u'enum'):
         try:
@@ -408,83 +516,60 @@ cpdef BaseReader get_reader(schema, dict schema_cache):
     reader = reader_type_map[schema_type](schema, schema_cache)
     # now that we've returned, assign the reader to the placeholder
     # so that the execution will work
-    placeholder.actual_reader = reader
+    placeholder.serde = reader
     return reader
 
 # ======================================================================
 
 
-cdef int write_int(outbuf, long long signed_datum) except -1:
+from cpython cimport PyBytes_FromStringAndSize
+cdef int write_long(outbuf, long long signed_datum) except -1:
     """int and long values are written using variable-length, zig-zag coding.
     """
     cdef:
         unsigned long long datum
-        char temp_datum
+        char buf[12]
+        Py_ssize_t i = 0
+        bytes bobj
     datum = (signed_datum << 1) ^ (signed_datum >> 63)
     while datum > 127:
-        temp_datum = (datum & 0x7f) | 0x80
-        outbuf.write((<char *>&temp_datum)[:sizeof(char)])
+        buf[i] = (datum & 0x7f) | 0x80
+        i += 1
         datum >>= 7
-    outbuf.write((<char *>&datum)[:sizeof(char)])
+    buf[i] = datum
+    i += 1
+    bobj = PyBytes_FromStringAndSize(buf, i)
+    outbuf.write(bobj)
     return 0
 
-write_long = write_int
 
-
-cdef int write_bytes(outbuf, datum) except -1:
+cdef int write_bytes(outbuf, bytes datum) except -1:
     """
     Bytes are encoded as a long followed by that many bytes of data. 
     """
-    cdef long byte_count = len(datum)
+    cdef Py_ssize_t byte_count = len(datum)
     write_long(outbuf, byte_count)
     outbuf.write(datum)
     return 0
 
 
 # except *
-cdef int write_utf8(outbuf, datum) except -1:
+from cpython.unicode cimport PyUnicode_AsUTF8String
+# Alternative would be to use PyUnicode_AsEncodedString with 'replace' handler
+cdef int write_utf8(outbuf, unicode datum) except -1:
     """
     Bytes are encoded as a long followed by that many bytes of data.
     """
-    write_bytes(outbuf, datum.encode("utf-8"))
+    cdef bytes bobj = PyUnicode_AsUTF8String(datum)
+    write_bytes(outbuf, bobj)
     return 0
 
 
-cdef int write_float(outbuf, float datum) except -1:
-    """
-    A float is written as 4 bytes.
-    The float is converted into a 32-bit integer using a method equivalent to
-    Java's floatToIntBits and then encoded in little-endian format.
-    """
-    outbuf.write((<char *>&datum)[:sizeof(float)])
-    return 0
-
-
-cdef int write_double(outbuf, double datum) except -1:
-    """
-    A double is written as 8 bytes.
-    The double is converted into a 64-bit integer using a method equivalent to
-    Java's doubleToLongBits and then encoded in little-endian format.
-    """
-    outbuf.write((<char *>&datum)[:sizeof(double)])
-    return 0
-
-
-cdef void write_null(outbuf, datum):
-    pass
-
-
-cdef int write_fixed(outbuf, datum) except -1:
-    """A fixed writer writes out exactly the bytes up to a count"""
-    outbuf.write(datum)
-    return 0
-
-
-cdef int write_boolean(outbuf, char datum) except -1:
+cdef int write_boolean(outbuf, bint datum) except -1:
     """A boolean is written as a single byte whose value is either 0 (false) or
     1 (true)."""
-    cdef char x = 1 if datum else 0
-    outbuf.write((<char *>&x)[:sizeof(char)])
+    cdef bytes x = b'\x01' if datum else b'\x00'
+    outbuf.write(x)
     return 0
 
 
@@ -517,6 +602,7 @@ py_to_avro = {
 }
 
 # ===============================
+from collections import namedtuple
 CheckField = namedtuple('CheckField', ['name', 'check'])
 
 def get_check(schema):
@@ -628,13 +714,11 @@ check_type_map = {
 # ====================
 
 def make_union_writer(union_schema, schema_cache):
-    cdef list type_list = [get_type(schema) for schema in union_schema]
-    # cdef dict writer_lookup
-    # cdef list record_list
+    cdef tuple schema_types = tuple(get_type(schema) for schema in union_schema)
     cdef dict writer_lookup_dict
-    cdef char simple_union
-    cdef list lookup_result
-    cdef long idx
+    cdef BaseSerDe writer
+    cdef bint simple_union
+    cdef Py_ssize_t idx
 
     # if there's more than one kind of record in the union
     # or if there's a string, enum or fixed combined in the union
@@ -643,9 +727,9 @@ def make_union_writer(union_schema, schema_cache):
     # dict so a simple python type lookup isn't enough to schema match.
     # enums, strings and fixed are all python data type unicode or string
     # so those won't work either when mixed
-    simple_union = not(type_list.count('record') > 1 or
-                      len(set(type_list) & set(['bytes', 'string', 'enum', 'fixed'])) > 1 or
-                      len(set(type_list) & set(['record', 'map'])) > 1)
+    simple_union = not(schema_types.count('record') > 1 or
+                      len(set(schema_types) & set(['bytes', 'string', 'enum', 'fixed'])) > 1 or
+                      len(set(schema_types) & set(['record', 'map'])) > 1)
 
     if simple_union:
         writer_lookup_dict = {avro_to_py[get_type(schema)]: 
@@ -657,10 +741,14 @@ def make_union_writer(union_schema, schema_cache):
         # warning, this will fail if there's both a long and int in a union
         # or a float and a double in a union (which is valid but nonsensical
         # in python but valid in avro)
-        def simple_writer_lookup(datum):
-            return writer_lookup_dict[type(datum)]
-
-        writer_lookup = simple_writer_lookup
+        if all(schema_type in primitive_types for schema_type in schema_types):
+            try:
+                writer = schema_cache[(ct_union, schema_types)]
+            except:
+                writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
+                schema_cache[(ct_union, schema_types)] = writer
+        else:
+            writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
     else:
         writer_lookup_dict = {}
         for idx, schema in enumerate(union_schema):
@@ -672,153 +760,122 @@ def make_union_writer(union_schema, schema_cache):
 
         if int in writer_lookup_dict:
             writer_lookup_dict[long] = writer_lookup_dict[int]
+        writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
+    
+    return writer
 
-        def complex_writer_lookup(datum):
-            cdef:
-                long idx
-                list lookup_result
-            lookup_result = writer_lookup_dict[type(datum)]
-            if len(lookup_result) == 1:
-                idx, get_check, writer = lookup_result[0]
-            else:
-                for idx, get_check, writer in lookup_result:
-                    if get_check(datum):
-                        break
-                else:
-                    raise TypeError("No matching schema for datum: {}".format(datum))
-            return idx, writer
-
-        writer_lookup = complex_writer_lookup
-
-    def write_union(outbuf, datum):
-        idx, data_writer = writer_lookup(datum)
-        write_long(outbuf, idx)
-        data_writer(outbuf, datum)
-    write_union.__reduce__ = lambda: (make_union_writer, (union_schema, schema_cache))
-    return write_union
 
 def make_enum_writer(schema, schema_cache):
-    cdef list symbols = schema['symbols']
-
-    # the datum can be str or unicode?
-    def write_enum(outbuf, basestring datum):
-        cdef int enum_index = symbols.index(datum)
-        write_int(outbuf, enum_index)
-    write_enum.__reduce__ = lambda: (make_enum_writer, (schema, schema_cache))
-    return write_enum
+    cdef tuple symbols = tuple(schema['symbols'])
+    return EnumSerDe(symbols)
 
 
 def make_record_writer(schema, schema_cache):
-    cdef list fields = [WriteField(field['name'], 
-        get_writer(field['type'], schema_cache)) for field in schema['fields']
-    ]
-
-    def write_record(outbuf, datum):
-        for field in fields:
-            field.writer(outbuf, datum.get(field.name))
-    write_record.__reduce__ = lambda: (make_record_writer, (schema, schema_cache))
-    return write_record
+    cdef tuple fields = tuple(
+        RecordField(
+            field['name'], 
+            get_writer(field['type'], schema_cache),
+            0
+        ) for field in schema['fields']
+    )
+    return RecordSerDe(fields)
 
 
 def make_array_writer(schema, schema_cache):
-    item_writer = get_writer(schema['items'], schema_cache)
-
-    def write_array(outbuf, list datum):
-        cdef long item_count = len(datum)
-        if item_count > 0:
-            write_long(outbuf, item_count)
-        for item in datum:
-            item_writer(outbuf, item)
-        write_long(outbuf, 0)
-    write_array.__reduce__ = lambda: (make_array_writer, (schema, schema_cache))
-    return write_array
+    cdef BaseSerDe writer
+    item_schema = schema['items']
+    item_type = get_type(item_schema)
+    if item_type in primitive_types:
+        try:
+            writer = schema_cache[(ct_array, item_type)]
+        except KeyError:
+            writer = ArraySerDe(get_writer(item_schema, schema_cache))
+            schema_cache[(ct_array, item_type)] = writer
+        return writer
+    writer = ArraySerDe(get_writer(item_schema, schema_cache))
+    return writer
 
 
 def make_map_writer(schema, schema_cache):
-    map_value_writer = get_writer(schema['values'], schema_cache)
+    cdef BaseSerDe writer
+    value_schema = schema['values']
+    value_type = get_type(value_schema)
+    if value_type in primitive_types:
+        try:
+            writer = schema_cache[(ct_map, value_type)]
+        except KeyError:
+            writer = MapSerDe(get_writer(value_schema, schema_cache))
+            schema_cache[(ct_map, value_type)] = writer
+        return writer
+    writer = MapSerDe(get_writer(value_schema, schema_cache))
+    return writer
 
-    def write_map(outbuf, datum):
-        cdef long item_count = len(datum)
-        if item_count > 0:
-            write_long(outbuf, item_count)
-        for key, val in datum.iteritems():
-            write_utf8(outbuf, key)
-            map_value_writer(outbuf, val)
-        write_long(outbuf, 0)
-    write_map.__reduce__ = lambda: (make_map_writer, (schema, schema_cache))
-    return write_map
 
-
-cdef checked_boolean_writer(outbuf, datum):
-    if not isinstance(datum, bool):
-        raise TypeError("Not a boolean value")
-    write_boolean(outbuf, datum)
+cdef int checked_boolean_writer(outbuf, datum) except -1:
+    write_boolean(outbuf, bool(datum))
+    return 0
 
 def make_boolean_writer(schema, schema_cache):
     '''Create a boolean writer, adds a validation step before the actual
     write function'''
-    return checked_boolean_writer
+    return boolean_serde_singleton
 
 
 def make_fixed_writer(schema, schema_cache):
     '''A writer that must write X bytes defined by the schema'''
-    cdef long size = schema['size']
-    # note: not a char* because those are null terminated and fixed
-    # has no such limitation
-    def checked_write_fixed(outbuf, datum):
-        if len(datum) != size:
-            raise TypeError("Size Mismatch for Fixed data")
-        write_fixed(outbuf, datum)
-    return checked_write_fixed
+    cdef Py_ssize_t size = schema['size']
+    return FixedSerDe(size, schema)
 
 
-cdef checked_int_write(outbuf, datum):
+cdef int checked_int_write(outbuf, datum) except -1:
     if not (isinstance(datum, six.integer_types)
         and INT_MIN_VALUE <= datum <= INT_MAX_VALUE
     ):
-        raise TypeError("Non integer value or overflow")
+        raise AvroTypeException(u'int', datum)
     write_long(outbuf, datum)
+    return 0
 
 def make_int_writer(schema, schema_cache):
     '''Create a int writer, adds a validation step before the actual
     write function to make sure the int value doesn't overflow'''
-    return checked_int_write
+    return int_serde_singleton
 
 
-cdef checked_long_write(outbuf, datum):
+cdef int checked_long_write(outbuf, datum) except -1:
     if not (isinstance(datum, six.integer_types)
         and LONG_MIN_VALUE <= datum <= LONG_MAX_VALUE
     ):
-        raise TypeError("Non integer value or overflow")
+        raise AvroTypeException(u'long', datum)
     write_long(outbuf, datum)
+    return 0
 
 def make_long_writer(schema, schema_cache):
     '''Create a long writer, adds a validation step before the actual
     write function to make sure the long value doesn't overflow'''
-    return checked_long_write
+    return long_serde_singleton
 
 
 def make_string_writer(schema, schema_cache):
     # Adding exception propagation to write_utf8 means that we do no have to
     # check the type; write_utf8 will raise an exception if the
     # encode('utf-8') method does not work.
-    return write_utf8
+    return utf8_serde_singleton
 
 
 def make_byte_writer(schema, schema_cache):
-    return write_bytes
+    return bytes_serde_singleton
 
 
 def make_float_writer(schema, schema_cache):
-    return write_float
+    return float_serde_singleton
 
 
 def make_double_writer(schema, schema_cache):
-    return write_double
+    return double_serde_singleton
 
 
 def make_null_writer(schema, schema_cache):
-    return write_null
+    return null_serde_singleton
 
 
 # writer
@@ -839,47 +896,32 @@ writer_type_map = {
     u'map': make_map_writer
 }
 
-
-cdef class WriterPlaceholder(object):
-    cdef object writer
-    def __init__(self):
-        self.writer = None
-
-    def __call__(self, fo, val):
-        return self.writer(fo, val)
-
-
-def get_writer(schema, schema_cache, top=False):
+cpdef get_writer(schema, schema_cache):
     cdef unicode schema_type = get_type(schema)
-    if schema_type in (u'record', u'fixed', u'enum'):
-        placeholder = WriterPlaceholder()
-        # using a placeholder because this is recursive and the reader isn't defined
-        # yet and nested records might refer to this parent schema name
-        namespace = schema.get('namespace')
-        name = schema.get('name')
-        if namespace:
-           fullname = '.'.join([namespace, name])
-        else:
-            fullname = name
-        schema_cache[fullname] = placeholder
-        writer = writer_type_map[schema_type](schema, schema_cache)
-        # now that we've returned, assign the reader to the placeholder
-        # so that the execution will work
-        placeholder.writer = writer
-        return writer
-    if top:
-        # If schema is a single primitive type, wrap with placeholder so that
-        # one has a Python callable, instead of just a cdef.
-        placeholder = WriterPlaceholder()
-        writer = writer_type_map[schema_type](schema, schema_cache)
-        placeholder.writer = writer
-        return writer
-    try:
-        writer_func = writer_type_map[schema_type]
-    except KeyError:
-        return schema_cache[schema_type]
-    return writer_func(schema, schema_cache)
+    cdef PlaceholderSerDe placeholder = PlaceholderSerDe()
+    cdef BaseSerDe writer = placeholder
+    
+    if schema_type not in (u'record', u'fixed', u'enum'):
+        try:
+            maker = writer_type_map[schema_type]
+        except KeyError:
+            return schema_cache[(ct_namespace, schema_type)]
+        return maker(schema, schema_cache)
 
+    # using a placeholder because this is recursive and the reader isn't defined
+    # yet and nested records might refer to this parent schema name
+    namespace = schema.get('namespace')
+    name = schema.get('name')
+    if namespace:
+        fullname = '.'.join([namespace, name])
+    else:
+        fullname = name
+    schema_cache[(ct_namespace, fullname)] = writer
+    writer = writer_type_map[schema_type](schema, schema_cache)
+    # now that we've returned, assign the reader to the placeholder
+    # so that the execution will work
+    placeholder.serde = writer
+    return writer
 
 
 
@@ -903,22 +945,22 @@ class FastBinaryEncoder(object):
         pass
 
     def write_boolean(self, datum):
-        write_boolean(self.writer, datum)
+        checked_boolean_writer(self.writer, datum)
 
     def write_int(self, datum):
-        write_int(self.writer, datum)
+        checked_int_write(self.writer, datum)
 
     def write_long(self, datum):
-        write_long(self.writer, datum)
+        checked_long_write(self.writer, datum)
 
     def write_float(self, datum):
-        write_float(self.writer, datum)
+        float_serde_singleton.c_write(self.writer, datum)
 
     def write_double(self, datum):
-        write_double(self.writer, datum)
+        double_serde_singleton.c_write(self.writer, datum)
 
     def write_bytes(self, datum):
-        write_bytes(self.writer, datum)
+        bytes_serde_singleton.c_write(self.writer, datum)
 
     def write_utf8(self, datum):
         write_utf8(self.writer, datum)
@@ -955,10 +997,10 @@ class FastBinaryDecoder(object):
         return read_long(self.reader)
 
     def read_float(self):
-        return read_float(self.reader)
+        return float_serde_singleton.c_read(self.reader)
 
     def read_double(self):
-        return read_double(self.reader)
+        return double_serde_singleton.c_read(self.reader)
 
     def read_bytes(self):
         return read_bytes(self.reader)
@@ -984,16 +1026,16 @@ class FastBinaryDecoder(object):
         read_long(self.reader)
 
     def skip_float(self):
-        read_float(self.reader)
+        self.reader.read(4)
 
     def skip_double(self):
-        read_double(self.reader)
+        self.reader.read(8)
 
     def skip_bytes(self):
         read_bytes(self.reader)
 
     def skip_utf8(self):
-        read_utf8(self.reader)
+        read_bytes(self.reader)
 
     def skip(self, n):
-        self.reader.seek(self.reader.tell() + n)
+        self.reader.seek(n, 1)
