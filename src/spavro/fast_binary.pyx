@@ -189,12 +189,10 @@ cdef class UnionSerDe(BaseSerDe):
     cdef object schema
     cdef tuple readers 
     cdef dict writer_lookup_dict
-    cdef bint simple
-    def __init__(self, schema, tuple readers=None, dict writer_lookup_dict=None, simple=True):
+    def __init__(self, schema, tuple readers=None, dict writer_lookup_dict=None):
         self.schema = schema
         self.readers = readers
         self.writer_lookup_dict = writer_lookup_dict
-        self.simple = simple
     cdef c_read(self, fo):
         '''Read the long index for which schema to process, then use that'''
         cdef Py_ssize_t union_index = read_long(fo)
@@ -203,19 +201,24 @@ cdef class UnionSerDe(BaseSerDe):
     cdef int c_write(self, fo, datum) except -1:
         cdef Py_ssize_t idx
         cdef BaseSerDe writer
+        idx, writer = self.writer_lookup_dict[type(datum)]
+        write_long(fo, idx)
+        return writer.c_write(fo, datum)
+
+cdef class UnionComplexSerDe(UnionSerDe):
+    cdef int c_write(self, fo, datum) except -1:
+        cdef Py_ssize_t idx
+        cdef BaseSerDe writer
         cdef list lookup_result
-        if self.simple:
-            idx, writer = self.writer_lookup_dict[type(datum)]
+        lookup_result = self.writer_lookup_dict[type(datum)]
+        if len(lookup_result) == 1:
+            idx, get_check, writer = lookup_result[0]
         else:
-            lookup_result = self.writer_lookup_dict[type(datum)]
-            if len(lookup_result) == 1:
-                idx, get_check, writer = lookup_result[0]
+            for idx, get_check, writer in lookup_result:
+                if get_check(datum):
+                    break
             else:
-                for idx, get_check, writer in lookup_result:
-                    if get_check(datum):
-                        break
-                else:
-                    raise AvroTypeException(self.schema, datum)
+                raise AvroTypeException(self.schema, datum)
         write_long(fo, idx)
         return writer.c_write(fo, datum)
 
@@ -744,23 +747,23 @@ def make_union_writer(union_schema, schema_cache):
         if all(schema_type in primitive_types for schema_type in schema_types):
             try:
                 writer = schema_cache[(ct_union, schema_types)]
-            except:
-                writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
+            except KeyError:
+                writer = UnionSerDe(union_schema, None, writer_lookup_dict)
                 schema_cache[(ct_union, schema_types)] = writer
         else:
-            writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
+            writer = UnionSerDe(union_schema, None, writer_lookup_dict)
     else:
         writer_lookup_dict = {}
         for idx, schema in enumerate(union_schema):
             python_type = avro_to_py[get_type(schema)]
-            if python_type in writer_lookup_dict:
-                writer_lookup_dict[python_type] = writer_lookup_dict[python_type] + [(idx, get_check(schema), get_writer(schema, schema_cache))]
-            else:
-                writer_lookup_dict[python_type] = [(idx, get_check(schema), get_writer(schema, schema_cache))]
-
+            if python_type not in writer_lookup_dict:
+                writer_lookup_dict[python_type] = list()
+            writer_lookup_dict[python_type].append(
+                (idx, get_check(schema), get_writer(schema, schema_cache))
+            )
         if int in writer_lookup_dict:
             writer_lookup_dict[long] = writer_lookup_dict[int]
-        writer = UnionSerDe(union_schema, None, writer_lookup_dict, simple_union)
+        writer = UnionComplexSerDe(union_schema, None, writer_lookup_dict)
     
     return writer
 
